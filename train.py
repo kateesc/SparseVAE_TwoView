@@ -78,6 +78,18 @@ def train_POEMS(
     M_train_all, M_val_all, M_test_all,
     sample_ids, idx_train, idx_val, idx_test) = load_data_mocs(disease=disease)
 
+    # ---- sparsity scaling (Fix #2) ----
+    base_gamma = 1.0
+    cap = 200.0  # start here
+
+    ratio = omic1_dim / max(1, omic2_dim)
+    gamma_mask2 = base_gamma
+    gamma_mask1 = base_gamma * min(ratio, cap)
+
+    print(f"[mask-gamma] base_gamma={base_gamma} cap={cap} ratio={ratio:.2f} "
+        f"gamma_mask1={gamma_mask1:.2f} gamma_mask2={gamma_mask2:.2f}")
+
+
     # ---- W&B ----
     if is_wandb:
         wandb.init(project=project_name)
@@ -255,6 +267,9 @@ def train_POEMS(
                     beta_kl_views=beta_kl_views,
                     mode="train",
                     bs=bs,
+                    gamma_mask1=gamma_mask1,
+                    gamma_mask2=gamma_mask2,
+                    gamma_sigma=1.0,
                 )
 
 
@@ -324,6 +339,9 @@ def train_POEMS(
                         beta_kl_views=beta_kl_views,
                         mode="val",
                         bs=bs,
+                        gamma_mask1=gamma_mask1,
+                        gamma_mask2=gamma_mask2,
+                        gamma_sigma=1.0,
                     )
                     
 
@@ -373,6 +391,9 @@ def train_POEMS(
                         beta_kl_views=beta_kl_views,
                         mode="val_dn",
                         bs=bs,
+                        gamma_mask1=gamma_mask1,
+                        gamma_mask2=gamma_mask2,
+                        gamma_sigma=1.0,
                     )
 
             val_loss_dict = {k: v / float(val_n) for k, v in val_loss_dict.items()}
@@ -994,6 +1015,9 @@ def update_loss_dict_return_total_loss(
     mode,
     *,
     bs,
+    gamma_mask1,
+    gamma_mask2,
+    gamma_sigma=1.0,
 ):
     w_bs = float(bs)
 
@@ -1035,7 +1059,10 @@ def update_loss_dict_return_total_loss(
             loss_dict[f"{mode}_{k}"] += new_loss_values[k].detach() * w_bs
 
     # total (NO alpha_reg)
-    total_loss_all = rec_loss_all + beta_kl * kl_loss_all + mask_loss_all + sigma_loss_all
+    mask_loss_all_scaled = gamma_mask1 * new_loss_values["mask_loss"][0] + gamma_mask2 * new_loss_values["mask_loss"][1]
+    sigma_loss_all_scaled = gamma_sigma * (new_loss_values["sigma_loss"][0] + new_loss_values["sigma_loss"][1])
+
+    total_loss_all = rec_loss_all + beta_kl * kl_loss_all + mask_loss_all_scaled + sigma_loss_all_scaled
     loss_dict[mode + "_total_loss_all"] += total_loss_all.detach() * w_bs
 
     return total_loss_all
