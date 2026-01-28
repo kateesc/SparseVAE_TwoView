@@ -535,278 +535,17 @@ def top_feature_indices_for_latent_view1(
     # rank by |W|
     idx = idx[np.argsort(absw[idx])[::-1]]
     return idx[:top_n]
+    
+# ========================
+# ACTIVE, MISSINGNESS-AS-SIGNAL ALIGNED FUNCTIONS
+# ========================
 
-import numpy as np
-import pandas as pd
-import torch
-
-def denoising_eval_view1(model, X_all, M_all, omic1_dim, omic2_dim,
-                         p_mask=0.15, batch_size=64, seed=0, max_samples=500):
-    """
-    TRUE MSE on:
-      - observed-kept entries (observed & not dropped)
-      - dropped entries (artificially masked observed entries)
-    """
-    device = next(model.parameters()).device
-    rng = np.random.default_rng(seed)
-
-    n = X_all.shape[0]
-    if max_samples is not None and n > max_samples:
-        rows = rng.choice(n, size=max_samples, replace=False)
-    else:
-        rows = np.arange(n)
-
-    X_np = np.asarray(X_all[rows], dtype=np.float32)
-    M_np = np.asarray(M_all[rows], dtype=np.float32)
-
-    def masked_sse_cnt(pred, true, mask):
-        err2 = (pred - true) ** 2
-        w = mask.to(dtype=err2.dtype)
-        return (err2 * w).sum().item(), w.sum().item()
-
-    model.eval()
-    sse_obs_keep = cnt_obs_keep = 0.0
-    sse_drop = cnt_drop = 0.0
-
-    gen = torch.Generator(device=device)
-    gen.manual_seed(12345 + seed)
-
-    with torch.no_grad():
-        for start in range(0, X_np.shape[0], batch_size):
-            end = min(start + batch_size, X_np.shape[0])
-
-            Xb = torch.tensor(X_np[start:end], device=device)
-            Mb = torch.tensor(M_np[start:end], device=device)
-
-            x1 = Xb[:, :omic1_dim]
-            x2 = Xb[:, omic1_dim:omic1_dim + omic2_dim]
-            m1 = Mb[:, :omic1_dim]
-            m2 = Mb[:, omic1_dim:omic1_dim + omic2_dim]
-
-            r = torch.rand(m1.shape, device=device, generator=gen)
-            drop = (r < p_mask) & (m1 > 0.5)
-
-            x1_in = x1.clone()
-            x1_in[drop] = 0.0
-            m1_in = m1.clone()
-            m1_in[drop] = 0.0
-
-            mean_comb, log_var, z_samp, alphas, aux = model.encode(x1_in, x2, m1=m1_in, m2=m2)
-            x1_rec = model.specific_modules["specific1"].decode(mean_comb)
-
-            mask_obs_keep = (m1 > 0.5) & (~drop)
-            mask_drop = drop
-
-            sse, cnt = masked_sse_cnt(x1_rec, x1, mask_obs_keep)
-            sse_obs_keep += sse; cnt_obs_keep += cnt
-
-            sse, cnt = masked_sse_cnt(x1_rec, x1, mask_drop)
-            sse_drop += sse; cnt_drop += cnt
-
-    mse_obs_keep = sse_obs_keep / (cnt_obs_keep + 1e-8)
-    mse_drop = sse_drop / (cnt_drop + 1e-8)
-
-    return {
-        "p_mask": float(p_mask),
-        "mse_obs_keep1": float(mse_obs_keep),
-        "mse_drop1": float(mse_drop),
-        "gap_drop_minus_obs1": float(mse_drop - mse_obs_keep),
-        "ratio_drop_over_obs1": float(mse_drop / (mse_obs_keep + 1e-8)),
-        "n_obs_keep_entries": float(cnt_obs_keep),
-        "n_drop_entries": float(cnt_drop),
-    }
+def _plot_annotation_text(ax, text):
+    # Lower left or upper left corner: customize as needed
+    ax.annotate(text, xy=(0.01, 0.98), xycoords="axes fraction", fontsize=9, va="top", ha="left", alpha=0.9, bbox=dict(fc='white', alpha=0.4))
 
 
-def denoising_difficulty_sweep_view1(model, X_all, M_all, omic1_dim, omic2_dim,
-                                    p_list=(0.02, 0.05, 0.10, 0.15, 0.20, 0.30),
-                                    batch_size=64, seed=0, max_samples=500):
-    rows = []
-    for p in p_list:
-        rows.append(denoising_eval_view1(
-            model, X_all, M_all, omic1_dim, omic2_dim,
-            p_mask=p, batch_size=batch_size, seed=seed, max_samples=max_samples
-        ))
-    return pd.DataFrame(rows)
 
-def latent_ablation_imputation_importance_view1(
-    model, X_all, M_all, omic1_dim, omic2_dim,
-    p_mask=0.15, batch_size=64, seed=0, max_samples=500
-):
-    """
-    For each latent k:
-      - compute dropped-entry MSE with full mean_comb
-      - compute dropped-entry MSE with mean_comb[:,k]=0
-      - delta = ablated - base
-    TRUE MSE, evaluated ONLY on dropped entries (drop mask).
-    """
-    device = next(model.parameters()).device
-    rng = np.random.default_rng(seed)
-
-    n = X_all.shape[0]
-    if max_samples is not None and n > max_samples:
-        rows = rng.choice(n, size=max_samples, replace=False)
-    else:
-        rows = np.arange(n)
-
-    X_np = np.asarray(X_all[rows], dtype=np.float32)
-    M_np = np.asarray(M_all[rows], dtype=np.float32)
-
-    K = model.specific_modules["specific1"].config["latent_dim"]
-
-    def _dropped_sse_cnt(x1_rec, x1_true, drop_mask):
-        err2 = (x1_rec - x1_true) ** 2
-        w = drop_mask.to(dtype=err2.dtype)
-        return (err2 * w).sum().item(), w.sum().item()
-
-    model.eval()
-    gen = torch.Generator(device=device)
-    gen.manual_seed(54321 + seed)
-
-    base_sse = base_cnt = 0.0
-    ab_sse = np.zeros(K, dtype=np.float64)
-    ab_cnt = 0.0
-
-    with torch.no_grad():
-        for start in range(0, X_np.shape[0], batch_size):
-            end = min(start + batch_size, X_np.shape[0])
-
-            Xb = torch.tensor(X_np[start:end], device=device)
-            Mb = torch.tensor(M_np[start:end], device=device)
-
-            x1 = Xb[:, :omic1_dim]
-            x2 = Xb[:, omic1_dim:omic1_dim + omic2_dim]
-            m1 = Mb[:, :omic1_dim]
-            m2 = Mb[:, omic1_dim:omic1_dim + omic2_dim]
-
-            r = torch.rand(m1.shape, device=device, generator=gen)
-            drop = (r < p_mask) & (m1 > 0.5)
-
-            x1_in = x1.clone(); x1_in[drop] = 0.0
-            m1_in = m1.clone(); m1_in[drop] = 0.0
-
-            mean_comb, log_var, z_samp, alphas, aux = model.encode(x1_in, x2, m1=m1_in, m2=m2)
-
-            # baseline (decode from mean to reduce noise)
-            x1_rec = model.specific_modules["specific1"].decode(mean_comb)
-            sse, cnt = _dropped_sse_cnt(x1_rec, x1, drop)
-            base_sse += sse
-            base_cnt += cnt
-
-            # ablate each latent in the fused mean
-            ab_cnt += cnt
-            for k in range(K):
-                mean_k = mean_comb.clone()
-                mean_k[:, k] = 0.0
-                x1_rec_k = model.specific_modules["specific1"].decode(mean_k)
-                sse_k, _ = _dropped_sse_cnt(x1_rec_k, x1, drop)
-                ab_sse[k] += sse_k
-
-    base_mse = base_sse / (base_cnt + 1e-8)
-    ab_mse = ab_sse / (ab_cnt + 1e-8)
-    delta = ab_mse - base_mse
-
-    df = pd.DataFrame({
-        "latent": np.arange(K, dtype=int),
-        "p_mask": float(p_mask),
-        "base_drop_mse1": float(base_mse),
-        "ablated_drop_mse1": ab_mse.astype(float),
-        "delta_drop_mse1": delta.astype(float),
-    }).sort_values("delta_drop_mse1", ascending=False)
-
-    return df
-
-def plot_denoising_difficulty_curve_view1(out_dir, csv_name="DenoisingDifficultyCurve_View1.csv"):
-    """
-    Plots denoising difficulty curve for view1 from a CSV.
-    Expected columns (flexible):
-      - p or p_mask or p_drop
-      - mse_imp or mse_drop or mse_imputed  (imputation error on dropped entries)
-      - mse_obs or mse_keep or mse_observed (error on observed-but-kept entries)
-    Also supports optional gap/ratio columns if present.
-    """
-    path = os.path.join(out_dir, csv_name)
-    if not os.path.exists(path):
-        print(f"[plot_denoising_difficulty_curve_view1] Missing file: {path}")
-        return
-
-    df = pd.read_csv(path)
-    if df.empty:
-        print(f"[plot_denoising_difficulty_curve_view1] Empty CSV: {path}")
-        return
-
-    # ---- find p column ----
-    p_col_candidates = ["p", "p_mask", "p_drop", "p_mask_v1", "p_mask_v1_val"]
-    p_col = next((c for c in p_col_candidates if c in df.columns), None)
-    if p_col is None:
-        # try fuzzy
-        p_col = next((c for c in df.columns if "p_" in c or c.startswith("p")), None)
-
-    # ---- find mse columns ----
-    imp_candidates = [
-        "mse_drop1", "mse_drop", "mse_imp", "mse_imputed", "mse_masked",
-        "val_dn_mse_imp1"
-    ]
-    obs_candidates = [
-        "mse_obs_keep1", "mse_obs_keep", "mse_obs", "mse_keep", "mse_observed",
-        "val_dn_mse_obs1"
-    ]
-
-
-    imp_col = next((c for c in imp_candidates if c in df.columns), None)
-    obs_col = next((c for c in obs_candidates if c in df.columns), None)
-
-    if p_col is None or imp_col is None or obs_col is None:
-        print("[plot_denoising_difficulty_curve_view1] Missing required columns.")
-        print("  Columns found:", list(df.columns))
-        print("  Need p + (imputed/drop MSE) + (observed/keep MSE).")
-        return
-
-    df = df.sort_values(p_col).reset_index(drop=True)
-
-    p = df[p_col].to_numpy()
-    mse_imp = df[imp_col].to_numpy()
-    mse_obs = df[obs_col].to_numpy()
-
-    # gap and ratio (compute even if not in file)
-    gap = mse_imp - mse_obs
-    ratio = mse_imp / (mse_obs + 1e-12)
-
-    # ---- Plot 1: MSE curves ----
-    plt.figure()
-    plt.plot(p, mse_obs, marker="o", label="Observed-kept MSE (view1)")
-    plt.plot(p, mse_imp, marker="o", label="Imputed/dropped MSE (view1)")
-    plt.xlabel("Drop probability p (view1)")
-    plt.ylabel("MSE")
-    plt.title("Denoising difficulty curve (View1)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "DenoisingDifficultyCurve_View1_MSE.png"), dpi=200)
-    plt.close()
-
-    # ---- Plot 2: Gap ----
-    plt.figure()
-    plt.plot(p, gap, marker="o")
-    plt.xlabel("Drop probability p (view1)")
-    plt.ylabel("MSE(imputed) - MSE(observed)")
-    plt.title("Denoising gap vs difficulty (View1)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "DenoisingDifficultyCurve_View1_Gap.png"), dpi=200)
-    plt.close()
-
-    # ---- Plot 3: Ratio ----
-    plt.figure()
-    plt.plot(p, ratio, marker="o")
-    plt.xlabel("Drop probability p (view1)")
-    plt.ylabel("MSE(imputed) / MSE(observed)")
-    plt.title("Imputation/observed error ratio vs difficulty (View1)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "DenoisingDifficultyCurve_View1_Ratio.png"), dpi=200)
-    plt.close()
-
-    print("[plot_denoising_difficulty_curve_view1] Wrote:")
-    print("  DenoisingDifficultyCurve_View1_MSE.png")
-    print("  DenoisingDifficultyCurve_View1_Gap.png")
-    print("  DenoisingDifficultyCurve_View1_Ratio.png")
 
 
 def _poems_encode_unpack(model, x1, x2, m1=None, m2=None):
@@ -1279,76 +1018,43 @@ def export_latent_top_features(model, disease, dir=None, top_snps=10, top_traits
 # -----------------------------
 # Your existing plotting functions below (unchanged)
 # -----------------------------
-def plot_tsne(data, label, dir=None, tag=None):
-    if isinstance(data, torch.Tensor):
-        data = data.detach().cpu().numpy()
-
-    plt.clf()
-
-    # sklearn TSNE uses n_iter (max_iter will crash on some versions)
-    try:
-        tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300, random_state=42)
-    except TypeError:
-        tsne = TSNE(n_components=2, verbose=1, perplexity=40, random_state=42)
-
-    tsne_results = tsne.fit_transform(data)
-
-    df = pd.DataFrame({"tsne-2d-one": tsne_results[:, 0], "tsne-2d-two": tsne_results[:, 1]})
-    sns.scatterplot(
-        x="tsne-2d-one",
-        y="tsne-2d-two",
-        hue=label,
-        palette=sns.color_palette("hls", len(np.unique(label))),
-        data=df,
-        legend="full",
-        alpha=0.7,
-        s=40
-    )
-
-    title = "t-SNE on latent representations" + (f" ({tag})" if tag else "")
-    plt.title(title, fontsize=14)
-    plt.xlabel("tsne-2d-one", fontsize=12)
-    plt.ylabel("tsne-2d-two", fontsize=12)
-
-    if dir is not None:
-        suffix = f"_{tag}" if tag else ""
-        plt.savefig(os.path.join(dir, f"tsne{suffix}.pdf"), bbox_inches="tight")
+def plot_tsne(latents, label, dir=None, tag=None, question_text=None):
+    from sklearn.manifold import TSNE
+    tsne = TSNE(n_components=2, random_state=42, perplexity=40, n_iter=300)
+    tsne_results = tsne.fit_transform(np.asarray(latents))
+    plt.figure(figsize=(7,5))
+    ax = plt.gca()
+    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=label, alpha=0.7, cmap='viridis', s=30)
+    plt.title("t-SNE on Latent Space", fontsize=16)
+    plt.xlabel("Dim 1")
+    plt.ylabel("Dim 2")
+    if question_text is None:
+        question_text = "Q: Do samples cluster by group in latent space?"
+    _plot_annotation_text(ax, question_text)
+    if dir:
+        plt.savefig(os.path.join(dir, f'tsne{"" if not tag else "_"+tag}.png'), bbox_inches="tight", dpi=160)
         plt.close()
     else:
         plt.show()
 
-
-def plot_umap(data, label, dir=None, tag=None):
-    if isinstance(data, torch.Tensor):
-        data = data.detach().cpu().numpy()
-
-    plt.clf()
-    embedding = umap.UMAP(random_state=42).fit_transform(data)
-
-    df = pd.DataFrame({"umap-2d-one": embedding[:, 0], "umap-2d-two": embedding[:, 1]})
-    sns.scatterplot(
-        x="umap-2d-one",
-        y="umap-2d-two",
-        hue=label,
-        palette=sns.color_palette("hls", len(np.unique(label))),
-        data=df,
-        legend="full",
-        alpha=0.7,
-        s=40
-    )
-
-    title = "UMAP on latent representations" + (f" ({tag})" if tag else "")
-    plt.title(title, fontsize=14)
-    plt.xlabel("umap-2d-one", fontsize=12)
-    plt.ylabel("umap-2d-two", fontsize=12)
-
-    if dir is not None:
-        suffix = f"_{tag}" if tag else ""
-        plt.savefig(os.path.join(dir, f"umap{suffix}.pdf"), bbox_inches="tight")
+def plot_umap(latents, label, dir=None, tag=None, question_text=None):
+    import umap
+    reducer = umap.UMAP(random_state=42)
+    embedding = reducer.fit_transform(np.asarray(latents))
+    plt.figure(figsize=(7,5))
+    ax = plt.gca()
+    plt.scatter(embedding[:, 0], embedding[:, 1], c=label, alpha=0.7, cmap='viridis', s=30)
+    plt.title("UMAP on Latent Space", fontsize=16)
+    plt.xlabel("UMAP 1")
+    plt.ylabel("UMAP 2")
+    if question_text is None:
+        question_text = "Q: Are latent factors nonlinearly associated with label or trait?"
+    _plot_annotation_text(ax, question_text)
+    if dir:
+        plt.savefig(os.path.join(dir, f'umap{"" if not tag else "_"+tag}.png'), bbox_inches="tight", dpi=160)
         plt.close()
     else:
         plt.show()
-
 
 def visualize_final_embedding(embeddings, labels, dir=None):
     if isinstance(embeddings, torch.Tensor):
@@ -2542,124 +2248,94 @@ def plot_kendall_contributions(out_dir: str, filename="loss_history.csv"):
 # 1) Missingness distributions + mask heatmap subset
 # ============================================================
 
-def plot_missingness_histograms(
-    M_all,
-    d1,
-    d2,
-    out_dir=None,
-    tag="all",
-    bins=50,
-):
-    """
-    Produces:
-      - Missingness_PerSample_<tag>.pdf
-      - Missingness_PerFeature_<tag>.pdf
-
-    M_all: (n_samples, d1+d2) mask in {0,1} (float ok)
-    """
-    _safe_makedirs(out_dir)
-    M_all = _ensure_np(M_all).astype(np.float64)
-    M1, M2 = _split_views_np(M_all, d1, d2)
-
-    # per-sample missing %
-    miss_samp1 = 100.0 * (1.0 - (M1.mean(axis=1) if d1 > 0 else 0.0))
-    miss_samp2 = 100.0 * (1.0 - (M2.mean(axis=1) if d2 > 0 else 0.0))
-
-    plt.figure(figsize=(7, 3))
-    if d1 > 0:
-        plt.hist(miss_samp1, bins=bins, alpha=0.6, label="View1 (% missing)")
-    if d2 > 0:
-        plt.hist(miss_samp2, bins=bins, alpha=0.6, label="View2 (% missing)")
-    plt.xlabel("% missing per sample")
-    plt.ylabel("count")
-    plt.title(f"Missingness per sample ({tag})")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
+def plot_missingness_histograms(M_all, omic1_dim, omic2_dim, out_dir, tag="train", question_text=None):
+    mask1 = M_all[:, :omic1_dim]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].hist(mask1.mean(1), bins=30, color="#1f77b4", alpha=0.8)
+    axes[0].set_title("Fraction Observed per Sample (SNPs)")
+    axes[1].hist(mask1.mean(0), bins=30, color="#1f77b4", alpha=0.8)
+    axes[1].set_title("Fraction Observed per SNP")
+    fig.suptitle(f"Missingness Histograms ({tag}/view1)", fontsize=15)
+    if question_text is None:
+        question_text = "Q: How is missing data distributed across samples and features?"
+    fig.text(0.01, 0.97, question_text, fontsize=9, va="top", ha="left")
     if out_dir:
-        plt.savefig(os.path.join(out_dir, f"Missingness_PerSample_{tag}.pdf"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join(out_dir, f'MissingnessHists_view1_{tag}.png'), bbox_inches="tight", dpi=160)
+        plt.close(fig)
+    else:
+        plt.show()
+        
+def plot_mask_heatmap_subset(M_all, omic1_dim, omic2_dim, out_dir, tag="train", view="view1", n_features=None, question_text=None):
+    plt.figure(figsize=(10, 4))
+    ax = plt.gca()
+    if view == "view1":
+        mask = M_all[:, :omic1_dim]
+    elif view == "view2":
+        mask = M_all[:, omic1_dim:omic1_dim + (n_features or omic2_dim)]
+    else:
+        raise ValueError("view must be 'view1' or 'view2'")
+    sns.heatmap(mask, cmap="Greys", cbar=False)
+    plt.xlabel("Feature index")
+    plt.ylabel("Sample index")
+    plt.title(f"Missingness Heatmap ({tag}/{view})", fontsize=13)
+    if question_text is None:
+        question_text = "Q: What is the structure of missingness in samples and features?"
+    _plot_annotation_text(ax, question_text)
+    if out_dir:
+        plt.savefig(os.path.join(out_dir, f'MissingnessHeatmap_{view}_{tag}.png'), bbox_inches="tight", dpi=160)
         plt.close()
     else:
         plt.show()
 
-    # per-feature missing %
-    miss_feat1 = 100.0 * (1.0 - (M1.mean(axis=0) if d1 > 0 else 0.0))
-    miss_feat2 = 100.0 * (1.0 - (M2.mean(axis=0) if d2 > 0 else 0.0))
-
-    plt.figure(figsize=(7, 3))
-    if d1 > 0:
-        plt.hist(miss_feat1, bins=bins, alpha=0.6, label="View1 (% missing)")
-    if d2 > 0:
-        plt.hist(miss_feat2, bins=bins, alpha=0.6, label="View2 (% missing)")
-    plt.xlabel("% missing per feature")
-    plt.ylabel("count")
-    plt.title(f"Missingness per feature ({tag})")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    if out_dir:
-        plt.savefig(os.path.join(out_dir, f"Missingness_PerFeature_{tag}.pdf"), dpi=300, bbox_inches="tight")
+def plot_mask_latent_correlation(model, X_all, M_all, out_dir, tag="train", question_text=None):
+    mean_comb, _ = model.get_final_embedding(X_all, M_all)
+    mask_frac = M_all[:, :model.specific_modules["specific1"].config["input_dim"]].mean(1)
+    for k in range(mean_comb.shape[1]):
+        plt.figure()
+        ax = plt.gca()
+        plt.scatter(mask_frac, mean_comb[:, k], alpha=0.25)
+        plt.xlabel("Fraction of SNPs observed (sample)")
+        plt.ylabel(f"Value of latent dim {k}")
+        plt.title(f"Latent {k} vs. SNP missingness (tag={tag})")
+        text = (question_text or "Q: Does latent factor value reflect global missingness pattern?")
+        _plot_annotation_text(ax, text)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"mask_vs_latent{str(k)}_{tag}.png"), bbox_inches="tight", dpi=120)
         plt.close()
-    else:
-        plt.show()
-
-
-def plot_mask_heatmap_subset(
-    M_all,
-    d1,
-    d2,
-    out_dir=None,
-    tag="all",
-    view="view1",
-    n_samples=200,
-    n_features=1000,
-    seed=0,
-):
-    """
-    Produces:
-      - MaskHeatmap_<view>_<tag>.pdf
-
-    For View1 (SNPs) you typically want a random subset because it's huge.
-    """
-    _safe_makedirs(out_dir)
-    rng = np.random.default_rng(seed)
-
-    M_all = _ensure_np(M_all).astype(np.float64)
-    M1, M2 = _split_views_np(M_all, d1, d2)
-
-    if view.lower() in ["view1", "v1", "specific1"]:
-        M = M1
-        feat_cap = d1
-        title_view = "View1"
-    else:
-        M = M2
-        feat_cap = d2
-        title_view = "View2"
-
-    n = M.shape[0]
-    if n == 0 or feat_cap == 0:
-        print(f"[plot_mask_heatmap_subset] Nothing to plot for {title_view}.")
-        return
-
-    s_idx = rng.choice(n, size=min(n_samples, n), replace=False)
-
-    f_idx = np.arange(feat_cap)
-    if feat_cap > n_features:
-        f_idx = rng.choice(feat_cap, size=n_features, replace=False)
-
-    sub = M[np.ix_(s_idx, f_idx)]
-
-    plt.figure(figsize=(8, 4))
-    plt.imshow(sub, aspect="auto", interpolation="nearest")
-    plt.xlabel("feature subset")
-    plt.ylabel("sample subset")
-    plt.title(f"Mask heatmap subset ({title_view}) ({tag})")
-    plt.colorbar(label="mask (1=observed)")
+        
+def plot_groupwise_mask_distribution(M_all, y, out_dir, tag="train", question_text=None):
+    mask_frac = M_all.mean(1)
+    group_labels = np.unique(y)
+    data = [mask_frac[np.array(y) == g] for g in group_labels]
+    plt.figure(figsize=(7,5))
+    ax = plt.gca()
+    plt.boxplot(data, labels=group_labels)
+    plt.xlabel("Group")
+    plt.ylabel("Fraction observed (per sample)")
+    plt.title("Groupwise Masked Fraction")
+    text = (question_text or "Q: Are any sample groups more missing overall? Technical covariate?")
+    _plot_annotation_text(ax, text)
     plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"groupwise_mask_fraction_{tag}.png"), bbox_inches="tight", dpi=140)
+    plt.close()
 
-    if out_dir:
-        plt.savefig(os.path.join(out_dir, f"MaskHeatmap_{title_view}_{tag}.pdf"), dpi=300, bbox_inches="tight")
-        plt.close()
-    else:
-        plt.show()
+def plot_mask_space_embedding(M_all, y, out_dir, tag="train", question_text=None):
+    from sklearn.decomposition import PCA
+    mask1 = M_all[:, :-1] if M_all.shape[1] > 1 else M_all
+    pca = PCA(n_components=2)
+    emb = pca.fit_transform(mask1)
+    plt.figure(figsize=(7, 5))
+    ax = plt.gca()
+    plt.scatter(emb[:, 0], emb[:, 1], c=y, cmap='viridis', s=20, alpha=0.6)
+    plt.title("PCA of Mask Patterns", fontsize=14)
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    text = (question_text or
+        "Q: Do samples cluster by group in MASK space? If so, missingness is informative.")
+    _plot_annotation_text(ax, text)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"maskspace_pca_{tag}.png"), bbox_inches="tight", dpi=140)
+    plt.close()
 
 
 # ============================================================
@@ -2708,73 +2384,6 @@ def plot_epoch_recon_obs_vs_all(
 
     _plot(1)
     _plot(2)
-
-
-def plot_epoch_imputed_vs_observed_gap_ratio(
-    out_dir: str,
-    filename: str = "loss_history.csv",
-):
-    """
-    Plots cheating detector curves if present.
-
-    Expected columns:
-      train_mse_obs1, train_mse_imp1, val_mse_obs1, val_mse_imp1
-      train_mse_obs2, train_mse_imp2, val_mse_obs2, val_mse_imp2
-
-    It will plot:
-      - gap = imp - obs
-      - ratio = imp / (obs+eps)
-    """
-    path = os.path.join(out_dir, filename)
-    if not os.path.exists(path):
-        print(f"[plot_epoch_imputed_vs_observed_gap_ratio] Missing {path}")
-        return
-
-    df = pd.read_csv(path)
-    epochs = df["epoch"].values if "epoch" in df.columns else np.arange(len(df))
-    eps = 1e-12
-
-    def _do(view_idx):
-        pairs = [
-            (f"train_mse_obs{view_idx}", f"train_mse_imp{view_idx}"),
-            (f"val_mse_obs{view_idx}",   f"val_mse_imp{view_idx}"),
-        ]
-        have_any = any((a in df.columns and b in df.columns) for a, b in pairs)
-        if not have_any:
-            print(f"[plot_epoch_imputed_vs_observed_gap_ratio] Missing obs/imp pairs for view{view_idx}.")
-            return
-
-        # GAP
-        plt.figure(figsize=(7, 3))
-        for a, b in pairs:
-            if a in df.columns and b in df.columns:
-                gap = df[b].values - df[a].values
-                plt.plot(epochs, gap, label=f"gap({b}-{a})")
-        plt.title(f"Imputed-vs-observed gap (View{view_idx})")
-        plt.xlabel("epoch")
-        plt.ylabel("MSE gap (imp - obs)")
-        plt.legend(fontsize=7)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"ReconMSE_Gap_ImpMinusObs_View{view_idx}.pdf"), dpi=300, bbox_inches="tight")
-        plt.close()
-
-        # RATIO
-        plt.figure(figsize=(7, 3))
-        for a, b in pairs:
-            if a in df.columns and b in df.columns:
-                ratio = df[b].values / (df[a].values + eps)
-                plt.plot(epochs, ratio, label=f"ratio({b}/{a})")
-        plt.title(f"Imputed/Observed ratio (View{view_idx})")
-        plt.xlabel("epoch")
-        plt.ylabel("ratio")
-        plt.yscale("log")
-        plt.legend(fontsize=7)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"ReconMSE_Ratio_ImpOverObs_View{view_idx}.pdf"), dpi=300, bbox_inches="tight")
-        plt.close()
-
-    _do(1)
-    _do(2)
 
 
 def _safe_div(num: float, den: float):
@@ -3160,7 +2769,6 @@ def plot_effective_vs_missingness(metrics: dict, out_dir=None, tag="test"):
     else:
         plt.show()
 
-
 # ============================================================
 # 6) Imputation baseline: training-mean baseline vs model
 # ============================================================
@@ -3249,32 +2857,6 @@ def plot_baseline_vs_model_bar(
         plt.close()
     else:
         plt.show()
-
-def plot_denoising_gap(out_dir: str, filename: str = "loss_history.csv"):
-    path = os.path.join(out_dir, filename)
-    if not os.path.exists(path):
-        print(f"[plot_denoising_gap] Missing {path}")
-        return
-    df = pd.read_csv(path)
-    if not ("val_dn_total_loss_all" in df.columns and "val_total_loss_all" in df.columns):
-        print("[plot_denoising_gap] Missing required columns.")
-        return
-
-    epochs = df["epoch"].values
-    gap = df["val_dn_total_loss_all"].values - df["val_total_loss_all"].values
-
-    plt.figure(figsize=(7,3))
-    plt.plot(epochs, gap, label="val_dn_total - val_clean_total")
-    plt.axhline(0.0, linestyle="--")
-    plt.title("Denoising penalty (robustness gap)")
-    plt.xlabel("epoch")
-    plt.ylabel("loss gap")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "Val_DenoisingGap_Total.pdf"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-
 
 
 # ============================================================
