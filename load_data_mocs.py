@@ -1,4 +1,3 @@
-# load_data_mocs.py
 import os
 import sys
 import numpy as np
@@ -22,12 +21,6 @@ def _train_feature_means(X_train: np.ndarray, M_train: np.ndarray, eps: float = 
     den = M_train.sum(axis=0)
     means = np.where(den > 0, num / (den + eps), 0.0)
     return means
-
-def _impute_with_means(X: np.ndarray, M: np.ndarray, means: np.ndarray) -> np.ndarray:
-    X_imp = X.copy()
-    missing = (M < 0.5)
-    X_imp[missing] = means[np.where(missing)[1]]
-    return X_imp
 
 def load_data_mocs(disease: str):
     print(os.path.join("data", disease))
@@ -77,8 +70,6 @@ def load_data_mocs(disease: str):
     M1 = np.isfinite(X1_raw).astype(np.float32)
     M2 = np.isfinite(X2_raw).astype(np.float32)
 
-    # keep NaN in X for now; we’ll impute after splitting
-
     n_clusters = int(len(np.unique(y_true)))
 
     # ----- Split by indices (keeps X and M consistent, no leakage) -----
@@ -99,35 +90,42 @@ def load_data_mocs(disease: str):
     M1_val,   M2_val   = M1[idx_val],   M2[idx_val]
     M1_test,  M2_test  = M1[idx_test],  M2[idx_test]
 
-    # ----- Impute using TRAIN means (per view) -----
-    means1 = _train_feature_means(np.nan_to_num(X1_train_raw, nan=0.0), M1_train)
-    means2 = _train_feature_means(np.nan_to_num(X2_train_raw, nan=0.0), M2_train)
+    # ----- Scaling: fit scaler ONLY on observed entries of training set -----
+    # To be sure, fit StandardScaler using mean-imputed, but DON'T use imputation for model input
+    # Prepare imputed training data just for scaler fit
+    def _impute_for_scaler(X, M):
+        means = _train_feature_means(np.nan_to_num(X, nan=0.0), M)
+        X_imp = X.copy()
+        missing = (M < 0.5)
+        X_imp[missing] = means[np.where(missing)[1]]
+        return X_imp
 
-    X1_train_imp = _impute_with_means(np.nan_to_num(X1_train_raw, nan=0.0), M1_train, means1)
-    X2_train_imp = _impute_with_means(np.nan_to_num(X2_train_raw, nan=0.0), M2_train, means2)
+    X1_train_for_scaler = _impute_for_scaler(X1_train_raw, M1_train)
+    X2_train_for_scaler = _impute_for_scaler(X2_train_raw, M2_train)
 
-    X1_val_imp = _impute_with_means(np.nan_to_num(X1_val_raw, nan=0.0), M1_val, means1)
-    X2_val_imp = _impute_with_means(np.nan_to_num(X2_val_raw, nan=0.0), M2_val, means2)
+    scaler1 = StandardScaler().fit(X1_train_for_scaler)
+    scaler2 = StandardScaler().fit(X2_train_for_scaler)
 
-    X1_test_imp = _impute_with_means(np.nan_to_num(X1_test_raw, nan=0.0), M1_test, means1)
-    X2_test_imp = _impute_with_means(np.nan_to_num(X2_test_raw, nan=0.0), M2_test, means2)
+    # Scale all splits (keep nans for missing data; models will use masks)
+    X1_train_scaled = scaler1.transform(X1_train_raw)
+    X2_train_scaled = scaler2.transform(X2_train_raw)
+    X1_val_scaled   = scaler1.transform(X1_val_raw)
+    X2_val_scaled   = scaler2.transform(X2_val_raw)
+    X1_test_scaled  = scaler1.transform(X1_test_raw)
+    X2_test_scaled  = scaler2.transform(X2_test_raw)
 
-    # ----- Scale using TRAIN-only scalers -----
-    scaler1 = StandardScaler().fit(X1_train_imp)
-    scaler2 = StandardScaler().fit(X2_train_imp)
-
-    X1_train = scaler1.transform(X1_train_imp).astype(np.float32)
-    X2_train = scaler2.transform(X2_train_imp).astype(np.float32)
-    X1_val   = scaler1.transform(X1_val_imp).astype(np.float32)
-    X2_val   = scaler2.transform(X2_val_imp).astype(np.float32)
-    X1_test  = scaler1.transform(X1_test_imp).astype(np.float32)
-    X2_test  = scaler2.transform(X2_test_imp).astype(np.float32)
+    # Fill missing with 0.0 after scaling (common for VAE masks; change if your model expects different)
+    X1_train = np.nan_to_num(X1_train_scaled, nan=0.0)
+    X2_train = np.nan_to_num(X2_train_scaled, nan=0.0)
+    X1_val   = np.nan_to_num(X1_val_scaled, nan=0.0)
+    X2_val   = np.nan_to_num(X2_val_scaled, nan=0.0)
+    X1_test  = np.nan_to_num(X1_test_scaled, nan=0.0)
+    X2_test  = np.nan_to_num(X2_test_scaled, nan=0.0)
 
     # Concatenate
     X_train_all = np.concatenate([X1_train, X2_train], axis=1)
     X_val_all   = np.concatenate([X1_val,   X2_val],   axis=1)
     X_test_all  = np.concatenate([X1_test,  X2_test],  axis=1)
-
     M_train_all = np.concatenate([M1_train, M2_train], axis=1)
     M_val_all   = np.concatenate([M1_val,   M2_val],   axis=1)
     M_test_all  = np.concatenate([M1_test,  M2_test],  axis=1)
@@ -141,7 +139,6 @@ def load_data_mocs(disease: str):
     idx_train = np.asarray(idx_train, dtype=int)
     idx_val   = np.asarray(idx_val, dtype=int)
     idx_test  = np.asarray(idx_test, dtype=int)
-
 
     return (
         d1, d2,
