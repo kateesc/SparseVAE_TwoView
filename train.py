@@ -555,6 +555,7 @@ def train_POEMS(
         util.plot_latent_pca_2d_3d(Z_toptrait, y_test, dir=out_dir, tag="test_toptrait")
         util.plot_tsne(Z_toptrait, y_test, out_dir, tag="test_toptrait")
         util.plot_umap(Z_toptrait, y_test, out_dir, tag="test_toptrait")
+        
         df_p = util.permutation_latent_trait_corr_pvals(
             Z_toptrait, X2_test, trait_names=trait_names,
             n_perm=2000, seed=0, two_sided=True,
@@ -712,12 +713,21 @@ def train_POEMS(
         df_featabl.to_csv(os.path.join(out_dir, "WithinFactorFeatureAblation_View1.csv"), index=False)
         df_ranked = df_featabl.sort_values("delta_mse", ascending=False)
         df_ranked.to_csv(os.path.join(out_dir, "WithinFactorFeatureAblation_View1_ranked.csv"), index=False)
-
+        
     util.plot_W_stats_over_epochs(out_dir)
     util.summarize_loss_history(out_dir)
     util.plot_loss_components(out_dir)
     util.plot_epoch_recon_obs_vs_all(out_dir)
     util.plot_all_csv_summaries(out_dir)
+    util.plot_mask_latent_correlation(model, X_train_all, M_train_all, out_dir, tag="train")
+    util.plot_groupwise_mask_distribution(M_train_all, y_train, out_dir, tag="train")
+    util.plot_mask_space_embedding(M_train_all, y_train, out_dir, tag="train")
+    util.plot_mask_latent_correlation(model, X_val_all, M_val_all, out_dir, tag="val")
+    util.plot_groupwise_mask_distribution(M_val_all, y_val, out_dir, tag="val")
+    util.plot_mask_space_embedding(M_val_all, y_val, out_dir, tag="val")
+    util.plot_mask_latent_correlation(model, X_test_all, M_test_all, out_dir, tag="test")
+    util.plot_groupwise_mask_distribution(M_test_all, y_test, out_dir, tag="test")
+    util.plot_mask_space_embedding(M_test_all, y_test, out_dir, tag="test")
 
     if is_wandb:
         wandb.log({
