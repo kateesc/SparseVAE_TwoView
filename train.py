@@ -345,7 +345,7 @@ def train_POEMS(
                 print(
                     f"Epoch {epoch}: "
                     f"Train loss={train_loss_dict['train_total_loss_all'].item():.4f} "
-                    f"Val={val_loss:.4f} ValDN={val_dn_loss:.4f} "
+                    f"Val={val_loss:.4f} "
                     f"(BEST score={best_score:.4f} @ epoch {best_epoch})"
                 )
 
