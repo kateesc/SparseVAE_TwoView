@@ -1,6 +1,6 @@
 import argparse
 from train import train_POEMS
-from bootstrap_sparse_vae import bootstrap_sparse_vae
+from bootstrap_sparse_vae import bootstrap_sparse_vae_with_splits
 import util
 
 def main():
@@ -46,7 +46,7 @@ def main():
         num_samples = args.num_samples if args.num_samples else X_train.shape[0]
 
         # Perform Bootstrapping on the train set
-        bootstrap_sparse_vae(
+        bootstrap_sparse_vae_with_splits(
             model_class=train_POEMS,
             disease=args.disease,
             train_data=(X_train, y_train, mask_train),
