@@ -37,7 +37,7 @@ def main():
         print("Running bootstrapping for Sparse VAE...")
     
         # Load the data and split into train/validation/test sets
-        from util import load_data_mocs
+        from load_data_mocs import load_data_mocs
         (X_train, X_val, X_test,
          y_train, y_val, y_test,
          mask_train, mask_val, mask_test) = load_data_mocs(disease=args.disease)
