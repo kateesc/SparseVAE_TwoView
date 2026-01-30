@@ -14,6 +14,7 @@ from sklearn.feature_selection import f_classif
 from sklearn.decomposition import PCA
 import json
 from typing import Dict, Any
+from collections import defaultdict
 
 # -----------------------------
 # Helpers
@@ -115,6 +116,150 @@ def export_latent_scores_csv(
     out_path = os.path.join(out_dir, f"LatentScores_{tag}.csv")
     df.to_csv(out_path, index=False)
     return out_path
+
+
+def export_top_features_by_latent(
+    model,
+    disease,
+    dir=None,
+    percentiles=(95, 99),
+    use_standardized=False,
+):
+    """
+    Exports top features (SNPs or traits) by latent factors filtered by raw or standardized |W| thresholds.
+    Produces separate CSV files for SNPs and traits for each percentile and threshold type.
+
+    Args:
+        model: Your trained POEMS model.
+        disease: Dataset name.
+        dir: Directory to save the CSV files.
+        percentiles: Tuple of percentiles (e.g., 95, 99).
+        use_standardized: Boolean, whether to include standardized |W| thresholds.
+
+    Outputs:
+        CSV files:
+        - LatentTopSNPs_percentile{X}_raw.csv
+        - LatentTopSNPs_percentile{X}_standardized.csv
+        - LatentTopTraits_percentile{X}_raw.csv
+        - LatentTopTraits_percentile{X}_standardized.csv
+    """
+    if dir:
+        os.makedirs(dir, exist_ok=True)
+
+    results = {
+        "SNPs": {"raw": {}, "standardized": {}},
+        "Traits": {"raw": {}, "standardized": {}},
+    }
+
+    for key, label, fname_prefix in [
+        ("specific1", "SNPs", "LatentTopSNPs"),
+        ("specific2", "Traits", "LatentTopTraits"),
+    ]:
+        W = model.specific_modules[key].W.detach().cpu().numpy()  # Weight matrix
+        pstar = model.specific_modules[key].pstar.detach().cpu().numpy()  # Inclusion probabilities
+        W_abs = np.abs(W)
+        snp_names = _safe_featnames(disease, view_idx=1 if label == "SNPs" else 2, n_features=W.shape[0])
+
+        for percentile in percentiles:
+            for value_type in ["raw", "standardized"]:
+                rows = []
+                # Raw thresholds
+                if value_type == "raw":
+                    cutoff = np.percentile(W_abs, percentile)
+                # Standardized thresholds
+                elif value_type == "standardized":
+                    W_mean = np.mean(W_abs)
+                    W_std = np.std(W_abs, ddof=1)
+                    W_std_abs = (W_abs - W_mean) / (W_std + 1e-12)
+                    cutoff = np.percentile(W_std_abs, percentile)
+
+                # Select features above the threshold
+                n_snps, K = W.shape
+                for k in range(K):
+                    if value_type == "raw":
+                        absw = np.abs(W[:, k])
+                        mask = absw > cutoff
+                    else:
+                        absw = W_std_abs[:, k]
+                        mask = absw > cutoff
+
+                    sel_indices = np.where(mask)[0]
+                    sel_sorted = sel_indices[np.argsort(absw[sel_indices])[::-1]]
+
+                    for rank, idx in enumerate(sel_sorted, start=1):
+                        rows.append({
+                            "latent": k,
+                            "rank": rank,
+                            "feature": snp_names[idx],
+                            "absW": W_abs[idx, k],  # absolute weight
+                            "signedW": W[idx, k],  # signed weight
+                            "pstar": pstar[idx, k],
+                        })
+
+                # Save results into CSV file
+                df = pd.DataFrame(rows)
+                filename = f"{fname_prefix}_percentile{percentile}_{value_type}.csv"
+                outfile = os.path.join(dir, filename)
+                df.to_csv(outfile, index=False)
+                print(f"Saved {outfile}")
+
+def plot_W_abs_distributions_and_standardized(model, out_dir, show=False, prefix=""):
+    """
+    Plots histograms and CDFs of raw |W| and standardized |W| for both views.
+    """
+    view_labels = [("specific1", "SNPs (View1)"), ("specific2", "Traits (View2)")]
+    abs_list = []
+    for key, label in view_labels:
+        W = model.specific_modules[key].W.detach().cpu().numpy()
+        W_abs = np.abs(W).flatten()
+        abs_list.append((W_abs, label))
+
+        # Raw |W| histogram
+        plt.figure(figsize=(8, 4))
+        plt.hist(W_abs, bins=100, density=True, alpha=0.7, color='royalblue')
+        plt.xlabel('|W| (absolute weight)')
+        plt.ylabel('Density')
+        plt.title(f'Absolute Weight Distribution: {label}')
+        plt.grid(True)
+        plt.tight_layout()
+        out_fn = os.path.join(out_dir, f"{prefix}W_abs_hist_{label.replace(' ', '_').replace('(', '').replace(')', '')}.png")
+        plt.savefig(out_fn)
+        if show: plt.show()
+        plt.close()
+
+        # Raw |W| CDF
+        plt.figure(figsize=(8, 4))
+        sorted_abs = np.sort(W_abs)
+        cdf = np.arange(1, len(sorted_abs)+1) / len(sorted_abs)
+        plt.plot(sorted_abs, cdf, marker='.')
+        plt.xlabel('|W| (absolute weight)')
+        plt.ylabel('Cumulative Fraction')
+        plt.title(f'Cumulative Distribution of |W|: {label}')
+        plt.grid(True)
+        plt.tight_layout()
+        out_fn = os.path.join(out_dir, f"{prefix}W_abs_cdf_{label.replace(' ', '_').replace('(', '').replace(')', '')}.png")
+        plt.savefig(out_fn)
+        if show: plt.show()
+        plt.close()
+
+    # Now plot BOTH standardized distributions on the same plot
+    plt.figure(figsize=(8, 4))
+    colors = ['royalblue', 'darkorange']
+    for i, (W_abs, label) in enumerate(abs_list):
+        W_mean = W_abs.mean()
+        W_std = W_abs.std(ddof=1)
+        W_abs_std = (W_abs - W_mean) / (W_std + 1e-12)
+        plt.hist(W_abs_std, bins=100, density=True, alpha=0.5, label=label, color=colors[i])
+    plt.xlabel('Standardized |W|')
+    plt.ylabel('Density')
+    plt.title('Standardized |W| Distributions, Both Views')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    out_fn = os.path.join(out_dir, f"{prefix}W_abs_std_hist_both_views.png")
+    plt.savefig(out_fn)
+    if show: plt.show()
+    plt.close()
 
 
 def orient_latent_scores_csv(in_csv, out_csv, signs):
@@ -2907,38 +3052,6 @@ def plot_within_factor_feature_ablation(out_dir, csv_name="WithinFactorFeatureAb
         plt.savefig(os.path.join(out_dir, "WithinFactorFeatureAblation_View1_BaseVsAblated_TopK.png"), dpi=200)
         plt.close()
 
-def plot_latent_ablation_imputation_importance(out_dir, csv_name="LatentAblation_ImputationImportance_View1.csv", top_k=30):
-    path = os.path.join(out_dir, csv_name)
-    if not os.path.exists(path):
-        print(f"[plot_latent_ablation_imputation_importance] Missing: {path}")
-        return
-
-    df = pd.read_csv(path)
-    if df.empty:
-        print(f"[plot_latent_ablation_imputation_importance] Empty: {path}")
-        return
-
-    # flexible column name
-    delta_col_candidates = ["delta_drop_mse1", "delta_mse", "delta"]
-    delta_col = next((c for c in delta_col_candidates if c in df.columns), None)
-
-    if "latent" not in df.columns or delta_col is None:
-        print("[plot_latent_ablation_imputation_importance] Missing columns. Found:", list(df.columns))
-        return
-
-    df = df.sort_values(delta_col, ascending=False)
-    top = df.head(top_k)
-
-    plt.figure(figsize=(10, 3))
-    plt.bar(np.arange(len(top)), top[delta_col].values)
-    plt.xticks(np.arange(len(top)), top["latent"].astype(int).astype(str).values, fontsize=7)
-    plt.xlabel("latent (ranked)")
-    plt.ylabel(f"{delta_col} (ablated - base)")
-    plt.title(f"Latent importance for imputation (View1 dropped entries) top {top_k}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "LatentAblation_ImputationImportance_View1_TopK.png"), dpi=200)
-    plt.close()
-
 def plot_permtest_latent_group(out_dir, csv_name="PermTest_LatentGroup_test_groupOriented.csv"):
     path = os.path.join(out_dir, csv_name)
     if not os.path.exists(path):
@@ -3075,10 +3188,106 @@ def plot_latent_orientation_by_toptrait(out_dir, csv_name="LatentOrientation_byT
     
 def plot_all_csv_summaries(out_dir):
             plot_within_factor_feature_ablation(out_dir, "WithinFactorFeatureAblation_View1.csv")
-            plot_latent_ablation_imputation_importance(out_dir, "LatentAblation_ImputationImportance_View1.csv")
             plot_permtest_latent_group(out_dir, "PermTest_LatentGroup_test_groupOriented.csv")
             plot_latent_group_ranking(out_dir, "LatentGroupRanking_test.csv")
             plot_latent_scores_by_group(out_dir, "LatentScores_test.csv")
             plot_latent_scores_by_group(out_dir, "LatentScores_test_oriented_byGroup.csv")
             plot_latent_orientation_by_toptrait(out_dir, "LatentOrientation_byTopTrait.csv")
+
+
+def bootstrap_stability_analysis(out_dir, num_bootstraps, top_n=10):
+    """
+    Analyze stability of top SNPs and latent factors across bootstraps.
+
+    Args:
+        out_dir: Directory containing results of bootstraps.
+        num_bootstraps: Number of bootstrap runs to analyze.
+        top_n: Number of top features to analyze for frequency of appearance.
+
+    Outputs:
+        - Stability statistics (Top SNPs per latent).
+    """
+    W1_files = [np.load(f) for f in sorted(os.listdir(out_dir)) if "W1.npy" in f]
+    top_features = defaultdict(int)  # Count SNPs in top-n across runs
+
+    for W in W1_files:
+        for latent_idx in range(W.shape[1]):
+            top_snps = np.argsort(-np.abs(W[:, latent_idx]))[:top_n]
+            for snp in top_snps:
+                top_features[(snp, latent_idx)] += 1
+
+    # Write the stability scores for SNPs to CSV
+    rows = [{"snp": snp, "latent": k, "frequency": freq / num_bootstraps} for (snp, k), freq in top_features.items()]
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(out_dir, "TopSNPStability.csv"), index=False)
+    print(f"Stability results saved to {os.path.join(out_dir, 'TopSNPStability.csv')}")    
+
+def compute_bootstrap_significance(out_dir, num_bootstraps):
+    """
+    Compute statistical significance of feature weights using bootstrapping.
+
+    Args:
+        out_dir: Directory containing bootstrap results.
+        num_bootstraps: Number of bootstrap runs.
+
+    Outputs:
+        - Bootstrap_W_mean.npy: Mean weights of features across bootstraps.
+        - Bootstrap_W_std.npy: Standard deviations across bootstraps.
+        - Bootstrap_W_zscores.npy: Significance metrics (z-scores).
+    """
+    W_files = [np.load(os.path.join(out_dir, f)) for f in os.listdir(out_dir) if "W1.npy" in f]
+    W_stack = np.stack(W_files, axis=-1)  # (n_features, n_latents, num_bootstraps)
+
+    # Calculate mean, std, and z-scores along the bootstrap axis
+    W_mean = np.mean(W_stack, axis=-1)
+    W_std = np.std(W_stack, axis=-1, ddof=1)
+    W_zscores = W_mean / (W_std + 1e-12)
+
+    # Save results
+    np.save(os.path.join(out_dir, "Bootstrap_W_mean.npy"), W_mean)
+    np.save(os.path.join(out_dir, "Bootstrap_W_std.npy"), W_std)
+    np.save(os.path.join(out_dir, "Bootstrap_W_zscores.npy"), W_zscores)
+    print(f"Bootstrap significance results saved in {out_dir}")
+
+def permutation_test_importance(model_class, X, mask, num_permutations, train_kwargs, out_dir):
+    """
+    Perform permutation testing for statistical significance of feature importance.
+
+    Args:
+        model_class: Your Sparse VAE class.
+        X: Input features.
+        mask: Mask for input features.
+        num_permutations: Number of permutations.
+        train_kwargs: Arguments for model training (e.g., lr, wd, etc.).
+        out_dir: Directory to save results.
+
+    Outputs:
+        - Permutation_pvalues.npy containing p-values for each feature.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Train model on original data to get observed W
+    model = model_class(**train_kwargs)
+    model.train(X, mask)
+    observed_W = model.specific_modules["specific1"].W.detach().cpu().numpy()
+    observed_W_abs = np.abs(observed_W)
+
+    # Permutation testing
+    permuted_W_distributions = []
+    for i in range(num_permutations):
+        print(f"Permutation {i+1}/{num_permutations}")
+        X_perm = np.random.permutation(X)
+        permuted_model = model_class(**train_kwargs)
+        permuted_model.train(X_perm, mask)
+
+        permuted_W = permuted_model.specific_modules["specific1"].W.detach().cpu().numpy()
+        permuted_W_distributions.append(permuted_W)
+
+    permuted_W_distributions = np.stack(permuted_W_distributions, axis=-1)  # (n_features, n_latents, num_permutations)
+    p_values = np.mean(permuted_W_distributions >= observed_W_abs[..., None], axis=2)
+
+    np.save(os.path.join(out_dir, "Permutation_pvalues.npy"), p_values)
+    print(f"Permutation p-values saved to {os.path.join(out_dir, 'Permutation_pvalues.npy')}")
+
+    return p_values
     
