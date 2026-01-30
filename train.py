@@ -90,6 +90,9 @@ def train_POEMS(
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
+    # Before starting the training loop
+    print(f"Training on {len(train_ds)} samples. Validating on {len(val_ds)} samples.")
+
     train_ds = torch.utils.data.TensorDataset(
         torch.tensor(X_train_all, dtype=torch.float),
         torch.tensor(M_train_all, dtype=torch.float),
@@ -98,9 +101,12 @@ def train_POEMS(
         torch.tensor(X_val_all, dtype=torch.float),
         torch.tensor(M_val_all, dtype=torch.float),
     )
-
+    
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+
+    # Log training and validation sizes
+    print(f"Training on {len(train_ds)} samples. Validating on {len(val_ds)} samples.")
 
     util.plot_missingness_histograms(M_train_all, omic1_dim, omic2_dim, out_dir, tag="train")
     util.plot_missingness_histograms(M_val_all,   omic1_dim, omic2_dim, out_dir, tag="val")
@@ -822,37 +828,3 @@ def init_loss_dict(mode, device=None):
     ]:
         loss_dict[f"{mode}_{k}"] = torch.zeros((), device=device)
     return loss_dict
-
-if __name__ == "__main__":
-    import argparse
-    import os
-    import util
-
-    # Command-line arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--disease", type=str, required=True, help="Dataset name")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--wd", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--nepoch", type=int, default=2000, help="Number of epochs")
-    parser.add_argument("--num_bootstrap", type=int, default=100, help="Number of bootstrap runs")
-    parser.add_argument("--num_samples", type=int, default=150, help="Number of samples in each bootstrap")
-    parser.add_argument("--out_dir", type=str, default="./bootstrap_results", help="Directory to save bootstrap results")
-    args = parser.parse_args()
-
-    # Load training data
-    X, y, mask = util.load_data_mocs(disease=args.disease)
-
-    # Perform Bootstrapping
-    bootstrap_sparse_vae(
-        model_class=POEMS,
-        data=(X, y, mask),
-        disease=args.disease,
-        num_samples=args.num_samples,
-        num_bootstrap=args.num_bootstrap,
-        out_dir=args.out_dir,
-        train_kwargs={"lr": args.lr, "wd": args.wd, "batch_size": args.batch_size, "nepoch": args.nepoch},
-    )
-
-    # Analyze Stability
-    util.bootstrap_stability_analysis(out_dir=args.out_dir, num_bootstraps=args.num_bootstrap, top_n=10)
