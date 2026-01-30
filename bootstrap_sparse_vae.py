@@ -77,11 +77,16 @@ def bootstrap_sparse_vae_with_splits(
     X_train, y_train, mask_train = train_data
     n_samples = num_samples if num_samples else X_train.shape[0]  # Default to full training set
 
+    # Inside for loop in bootstrap_sparse_vae_with_splits
     for bootstrap_idx in range(1, num_bootstrap + 1):
         print(f"Bootstrap {bootstrap_idx}/{num_bootstrap}")
 
         # Create a subsampled training set using stratified resampling
         X_resampled, y_resampled, mask_resampled = stratified_resample(X_train, y_train, mask_train, n_samples)
+
+        # Log the sizes of the splits for verification
+        print(f"Bootstrap {bootstrap_idx}: Training size = {X_resampled.shape[0]}, "
+              f"Validation size = {val_data[0].shape[0]}, Test size = {test_data[0].shape[0]}")
 
         # Train Sparse VAE with the subsampled training set
         model = model_class(**train_kwargs)
@@ -91,11 +96,11 @@ def bootstrap_sparse_vae_with_splits(
         W1 = model.specific_modules["specific1"].W.detach().cpu().numpy()
         W2 = model.specific_modules["specific2"].W.detach().cpu().numpy()
         pstar1 = model.specific_modules["specific1"].pstar.detach().cpu().numpy()
-        pstar2 = model.specific_modules["specific2"].pstar.detach().cpu().numpy()
+        pstar2 = model.specific_modules["specific1"].pstar.detach().cpu().numpy()
 
         np.save(os.path.join(out_dir, f"bootstrap_{bootstrap_idx}_W1.npy"), W1)
         np.save(os.path.join(out_dir, f"bootstrap_{bootstrap_idx}_W2.npy"), W2)
         np.save(os.path.join(out_dir, f"bootstrap_{bootstrap_idx}_pstar1.npy"), pstar1)
         np.save(os.path.join(out_dir, f"bootstrap_{bootstrap_idx}_pstar2.npy"), pstar2)
 
-        print(f"Bootstrap {bootstrap_idx} results saved.")        
+        print(f"Bootstrap {bootstrap_idx} results saved.")       
