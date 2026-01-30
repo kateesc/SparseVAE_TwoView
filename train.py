@@ -133,8 +133,9 @@ def train_POEMS(
         sig_df=sig_df_1,
         sig_scale=sig_scale_1,
         row_normalize=row_normalize,
+        use_mask_input=True
     )
-    omic1_info["use_mask_input"] = True
+    
     sigmas_init_2 = np.std(X_train_all[:, omic1_dim:omic1_dim + omic2_dim], axis=0) + 1e-6
     sig_df_2, sig_scale_2 = get_sigma_params(sigmas_init_2, disease)
     omic2_info = dict(
@@ -144,8 +145,9 @@ def train_POEMS(
         sig_df=sig_df_2,
         sig_scale=sig_scale_2,
         row_normalize=row_normalize,
+        use_mask_input=True
     )
-    omic2_info["use_mask_input"] = True
+    
 
     model = POEMS(batch_size, omic1_info, omic2_info).to(device)
     if is_wandb:
@@ -285,6 +287,11 @@ def train_POEMS(
             val_loss_dict = {k: v / float(val_n) for k, v in val_loss_dict.items()}
             val_loss = val_loss_dict["val_total_loss_all"].item()
             early_stop_score = val_loss
+
+            if val_loss < best_score:
+                best_score = val_loss
+                best_epoch = epoch
+                best_state = copy.deepcopy(model.state_dict())
 
             # ---- Record loss history ----
             row = {
@@ -718,6 +725,14 @@ def train_POEMS(
     util.summarize_loss_history(out_dir)
     util.plot_loss_components(out_dir)
     util.plot_epoch_recon_obs_vs_all(out_dir)
+    util.plot_W_abs_distributions_and_standardized(model, out_dir)
+    util.export_top_features_by_latent(
+        model=model, 
+        disease=disease, 
+        dir=out_dir,
+        percentiles=(95, 99),  # Generate outputs for both 95th and 99th percentiles
+        use_standardized=True  # Include cutoffs for standardized |W|
+    )
     util.plot_all_csv_summaries(out_dir)
     util.plot_mask_latent_correlation(model, X_train_all, M_train_all, out_dir, tag="train")
     util.plot_groupwise_mask_distribution(M_train_all, y_train, out_dir, tag="train")
@@ -728,6 +743,16 @@ def train_POEMS(
     util.plot_mask_latent_correlation(model, X_test_all, M_test_all, out_dir, tag="test")
     util.plot_groupwise_mask_distribution(M_test_all, y_test, out_dir, tag="test")
     util.plot_mask_space_embedding(M_test_all, y_test, out_dir, tag="test")
+    # Analyze Stability
+    util.bootstrap_stability_analysis(out_dir="./bootstrap_results", num_bootstraps=100, top_n=10)
+    # Bootstrapping
+    bootstrap_sparse_vae(model_class=POEMS, data=(X_train_all, y_train, M_train_all), num_samples=150, num_bootstraps=100, out_dir="./bootstrap_results", lr=0.001, wd=0.01, batch_size=32, nepoch=50)
+
+    # Analyze Stability
+    util.analyze_bootstrap_stability(out_dir="./bootstrap_results", num_bootstraps=100, top_n=10)
+
+    # Permutation Testing
+    p_values = util.permutation_test_importance(model_class=POEMS, data=(X_train_all, y_train, M_train_all), num_permutations=100, out_dir="./permutation_results", lr=0.001, wd=0.01, batch_size=32, nepoch=50)
 
     if is_wandb:
         wandb.log({
@@ -797,3 +822,37 @@ def init_loss_dict(mode, device=None):
     ]:
         loss_dict[f"{mode}_{k}"] = torch.zeros((), device=device)
     return loss_dict
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import util
+
+    # Command-line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--disease", type=str, required=True, help="Dataset name")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--wd", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--nepoch", type=int, default=2000, help="Number of epochs")
+    parser.add_argument("--num_bootstrap", type=int, default=100, help="Number of bootstrap runs")
+    parser.add_argument("--num_samples", type=int, default=150, help="Number of samples in each bootstrap")
+    parser.add_argument("--out_dir", type=str, default="./bootstrap_results", help="Directory to save bootstrap results")
+    args = parser.parse_args()
+
+    # Load training data
+    X, y, mask = util.load_data_mocs(disease=args.disease)
+
+    # Perform Bootstrapping
+    bootstrap_sparse_vae(
+        model_class=POEMS,
+        data=(X, y, mask),
+        disease=args.disease,
+        num_samples=args.num_samples,
+        num_bootstrap=args.num_bootstrap,
+        out_dir=args.out_dir,
+        train_kwargs={"lr": args.lr, "wd": args.wd, "batch_size": args.batch_size, "nepoch": args.nepoch},
+    )
+
+    # Analyze Stability
+    util.bootstrap_stability_analysis(out_dir=args.out_dir, num_bootstraps=args.num_bootstrap, top_n=10)
