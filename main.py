@@ -41,6 +41,9 @@ def main():
         (X_train, X_val, X_test,
          y_train, y_val, y_test,
          mask_train, mask_val, mask_test) = load_data_mocs(disease=args.disease)
+
+        # Print dataset shapes
+        print(f"Dataset shapes: Train={X_train.shape}, Validation={X_val.shape}, Test={X_test.shape}")
     
         # Handle sampling size
         num_samples = args.num_samples if args.num_samples else X_train.shape[0]
